@@ -152,9 +152,17 @@ $execute {
 		const bool shouldEatInput = ImGui::GetIO().WantCaptureKeyboard || shouldBlockInput();
 		const bool isDown = evt.action != KeyboardInputData::Action::Release;
 		if (shouldEatInput || !isDown) {
+			auto& io = ImGui::GetIO();
+		
+		#ifdef GEODE_IS_WINDOWS
+            io.AddKeyEvent(ImGuiMod_Ctrl, static_cast<bool>(evt.modifiers & KeyboardModifier::Control));
+            io.AddKeyEvent(ImGuiMod_Shift, static_cast<bool>(evt.modifiers & KeyboardModifier::Shift));
+            io.AddKeyEvent(ImGuiMod_Alt,static_cast<bool>(evt.modifiers & KeyboardModifier::Alt));
+        #endif
+		
 			const auto imKey = cocosToImGuiKey(evt.key);
 			if (imKey != ImGuiKey_None) {
-				ImGui::GetIO().AddKeyEvent(imKey, isDown);
+				io.AddKeyEvent(imKey, isDown);
 
 				// handle pasting
 				if (isDown && evt.key == KEY_V
@@ -164,7 +172,7 @@ $execute {
 					&& (evt.modifiers & KeyboardModifier::Control)
 			#endif
 				) {
-					ImGui::GetIO().AddInputCharactersUTF8(clipboard::read().c_str());
+					io.AddInputCharactersUTF8(clipboard::read().c_str());
 				}
 			}
 		}
