@@ -11,6 +11,92 @@
 
 using namespace geode::prelude;
 
+struct GLCaps {
+	int version = 210;
+	bool hasVAO = false;
+	bool hasBaseVertex = false;
+};
+
+static GLCaps s_caps;
+static GLuint s_vao = 0;
+static GLuint s_vbo = 0;
+static GLuint s_ibo = 0;
+
+static constexpr GLenum IDX_TYPE = sizeof(ImDrawIdx) == 2 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT;
+
+static bool hasExtension(std::string_view ext) {
+	auto* exts = reinterpret_cast<char const*>(glGetString(GL_EXTENSIONS));
+	if (!exts) return false;
+	std::string_view sv{exts};
+
+	for (size_t pos = 0; (pos = sv.find(ext, pos)) != std::string_view::npos; pos += ext.size()) {
+		size_t end = pos + ext.size();
+		if ((pos == 0 || sv[pos - 1] == ' ') && (end == sv.size() || sv[end] == ' '))
+			return true;
+	}
+
+	return false;
+}
+
+static int queryGLVersion() {
+	int major = 0;
+	int minor = 0;
+#ifdef GEODE_IS_WINDOWS
+	// macos opengl is really outdated, and doesnt have these enums
+	glGetIntegerv(GL_MAJOR_VERSION, &major);
+	glGetIntegerv(GL_MINOR_VERSION, &minor);
+	glGetError();
+#endif
+	if (major == 0 && minor == 0) {
+		auto* p = reinterpret_cast<char const*>(glGetString(GL_VERSION));
+		if (p && std::strncmp(p, "OpenGL ES", 9) == 0) {
+			p += 9;
+			while (*p && !(*p >= '0' && *p <= '9')) ++p;
+		}
+
+		if (!p || sscanf(p, "%d.%d", &major, &minor) != 2) {
+			// failed to parse version string, just assume opengl 2.1 / ES 2.0
+			GEODE_MOBILE(return 200);
+			return 210;
+		}
+	}
+
+	return major * 100 + minor * 10;
+}
+
+static GLCaps detectCaps() {
+	GLCaps caps;
+	caps.version = queryGLVersion();
+
+#ifndef GEODE_IS_ANDROID
+	#if defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
+	caps.hasVAO = hasExtension("GL_APPLE_vertex_array_object");
+	#else
+	caps.hasVAO = caps.version >= 300 || hasExtension("GL_ARB_vertex_array_object");
+	#endif
+
+	#if defined(GEODE_IS_WINDOWS)
+	caps.hasVAO = caps.hasVAO && glGenVertexArrays && glBindVertexArray && glDeleteVertexArrays;
+	#endif
+#endif
+
+#ifndef GEODE_IS_MOBILE
+	caps.hasBaseVertex = caps.hasVAO && caps.version >= 320;
+	#if defined(GEODE_IS_WINDOWS)
+	caps.hasBaseVertex = caps.hasBaseVertex && glDrawElementsBaseVertex;
+	#endif
+#endif
+
+	return caps;
+}
+
+static void destroyGLObjects() {
+	if (s_vao) glDeleteVertexArrays(1, &s_vao);
+	if (s_vbo) glDeleteBuffers(1, &s_vbo);
+	if (s_ibo) glDeleteBuffers(1, &s_ibo);
+	s_vao = s_vbo = s_ibo = 0;
+}
+
 // little helper function to convert ImTexture2D <=> GLuint,
 // supporting both versions of imgui where this was a void* and is now a u64
 
@@ -158,11 +244,15 @@ void ImGuiCocos::toggle() {
 
 void ImGuiCocos::setVisible(bool v) {
 	m_visible = v;
+	if (!m_initialized) return;
+
 	auto& io = ImGui::GetIO();
 	if (!m_visible) {
 		io.WantCaptureKeyboard = false;
 		io.WantCaptureMouse = false;
 		io.WantTextInput = false;
+		io.ClearInputKeys();
+		io.ClearInputMouse();
 
 #ifdef MAT_SUPPORTS_CURSOR
 		setMouseCursor(ImGuiMouseCursor_Arrow);
@@ -203,31 +293,11 @@ ImGuiCocos& ImGuiCocos::setup() {
 
 	auto& io = ImGui::GetIO();
 
-	static const int glVersion = [] {
-	#if defined(GEODE_IS_ANDROID)
-		// android uses GLES v2
-		return 200;
-	#endif
-		int major = 0;
-		int minor = 0;
-	#if defined(GEODE_IS_WINDOWS)
-		// macos opengl is really outdated, and doesnt have these enums
-		glGetIntegerv(GL_MAJOR_VERSION, &major);
-		glGetIntegerv(GL_MINOR_VERSION, &minor);
-	#endif
-		if (major == 0 && minor == 0) {
-			auto* verStr = reinterpret_cast<const char*>(glGetString(GL_VERSION));
-			if (!verStr || sscanf(verStr, "%d.%d", &major, &minor) != 2) {
-				// failed to parse version string, just assume opengl 2.1
-				return 210;
-			}
-		}
-		return major * 100 + minor * 10;
-	}();
+	s_caps = detectCaps();
 
 	io.BackendPlatformName = "gd-imgui-cocos + Geode";
 	io.BackendPlatformUserData = this;
-	if (glVersion >= 320) {
+	if (s_caps.hasBaseVertex) {
 		io.BackendFlags |= ImGuiBackendFlags_RendererHasVtxOffset;
 	}
 #ifdef IMGUI_HAS_TEXTURES
@@ -250,6 +320,9 @@ ImGuiCocos& ImGuiCocos::setup() {
 	};
 #endif
 
+	io.SetAppAcceptingEvents(m_visible);
+	m_lastCursor = ImGuiMouseCursor_COUNT;
+
 	m_initialized = true;
 
 	m_setupCall();
@@ -270,6 +343,7 @@ ImGuiCocos& ImGuiCocos::setup() {
 
 void ImGuiCocos::destroy() {
 	if (!m_initialized) return;
+	destroyGLObjects();
 
 	ImGui::GetIO().BackendPlatformUserData = nullptr;
 #ifdef IMGUI_HAS_TEXTURES
@@ -381,86 +455,101 @@ void ImGuiCocos::newFrame() {
 #endif
 }
 
-static bool hasExtension(const std::string_view ext) {
-	static auto exts = reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS));
-	if (exts == nullptr)
-		return false;
+struct FrameTransform {
+	CCEGLView* view;
+	float scaleX, scaleY, winHeight;
 
-	return std::string_view(exts).find(ext) != std::string::npos;
-}
+	static FrameTransform current() {
+		auto* director = CCDirector::get();
+		auto* view = director->getOpenGLView();
+		auto frameSize = view->getFrameSize() * utils::getDisplayFactor();
+		auto winSize = director->getWinSize();
+		return {
+			view,
+			winSize.width / frameSize.width,
+			winSize.height / frameSize.height,
+			winSize.height
+		};
+	}
 
-static void drawTriangle(const std::array<CCPoint, 3>& poly, const std::array<ccColor4F, 3>& colors, const std::array<CCPoint, 3>& uvs) {
+	bool applyScissor(ImVec4 const& clip) {
+		float x0 = clip.x * scaleX;
+		float x1 = clip.z * scaleX;
+		float yTop = winHeight - clip.y * scaleY;
+		float yBottom = winHeight - clip.w * scaleY;
+		if (x1 <= x0 || yTop <= yBottom)
+			return false;
+
+		view->setScissorInPoints(x0, yBottom, x1 - x0, yTop - yBottom);
+		return true;
+	}
+};
+
+struct ScopedImGuiMatrix {
+	explicit ScopedImGuiMatrix(FrameTransform const& tf) {
+		kmGLMatrixMode(KM_GL_MODELVIEW);
+		kmGLPushMatrix();
+		kmGLLoadIdentity();
+		kmGLTranslatef(0.f, tf.winHeight, 0.f);
+		kmGLScalef(tf.scaleX, -tf.scaleY, 1.f);
+	}
+
+	~ScopedImGuiMatrix() {
+		kmGLMatrixMode(KM_GL_MODELVIEW);
+		kmGLPopMatrix();
+	}
+
+	ScopedImGuiMatrix(ScopedImGuiMatrix const&) = delete;
+	ScopedImGuiMatrix& operator=(ScopedImGuiMatrix const&) = delete;
+};
+
+static void useImGuiShader() {
 	auto* shader = CCShaderCache::sharedShaderCache()->programForKey(kCCShader_PositionTextureColor);
 	shader->use();
 	shader->setUniformsForBuiltins();
-
-	ccGLEnableVertexAttribs(kCCVertexAttribFlag_PosColorTex);
-
-	static_assert(sizeof(CCPoint) == sizeof(ccVertex2F), "so the cocos devs were right then");
-
-	glVertexAttribPointer(kCCVertexAttrib_Position, 2, GL_FLOAT, GL_FALSE, 0, poly.data());
-	glVertexAttribPointer(kCCVertexAttrib_Color, 4, GL_FLOAT, GL_FALSE, 0, colors.data());
-	glVertexAttribPointer(kCCVertexAttrib_TexCoords, 2, GL_FLOAT, GL_FALSE, 0, uvs.data());
-
-	glDrawArrays(GL_TRIANGLE_FAN, 0, 3);
 }
 
 void ImGuiCocos::legacyRenderFrame() const {
+	auto* drawData = ImGui::GetDrawData();
+	auto tf = FrameTransform::current();
+
 	glEnable(GL_SCISSOR_TEST);
 
-	auto* drawData = ImGui::GetDrawData();
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
+	glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
 
-#ifdef IMGUI_HAS_TEXTURES
-	if (drawData->Textures != nullptr) {
-		for (auto* tex : *drawData->Textures) {
-			if (tex->Status != ImTextureStatus_OK) {
-				this->updateTexture(tex);
-			}
-		}
-	}
-#endif
+	ScopedImGuiMatrix matrix(tf);
+	auto setupState = [] {
+		useImGuiShader();
+		ccGLEnableVertexAttribs(kCCVertexAttribFlag_PosColorTex);
+	};
+	setupState();
 
 	for (int i = 0; i < drawData->CmdListsCount; ++i) {
 		auto* list = drawData->CmdLists[i];
-		auto* idxBuffer = list->IdxBuffer.Data;
-		auto* vtxBuffer = list->VtxBuffer.Data;
+		auto* vtx = list->VtxBuffer.Data;
+		auto* idx = list->IdxBuffer.Data;
+
 		for (auto& cmd : list->CmdBuffer) {
+			if (cmd.UserCallback != nullptr) {
+				if (cmd.UserCallback == ImDrawCallback_ResetRenderState) {
+					setupState();
+				} else {
+					cmd.UserCallback(list, &cmd);
+				}
+				continue;
+			}
+
+			if (cmd.ElemCount == 0 || !tf.applyScissor(cmd.ClipRect)) continue;
+
 			ccGLBindTexture2D(toGLTexture(cmd.GetTexID()));
 
-			const auto rect = cmd.ClipRect;
-			const auto orig = frameToCocos(ImVec2(rect.x, rect.y));
-			const auto end = frameToCocos(ImVec2(rect.z, rect.w));
-			if (end.x <= orig.x || end.y >= orig.y)
-				continue;
-			CCDirector::sharedDirector()->getOpenGLView()->setScissorInPoints(orig.x, end.y, end.x - orig.x, orig.y - end.y);
+			auto* base = reinterpret_cast<char const*>(vtx + cmd.VtxOffset);
+			glVertexAttribPointer(kCCVertexAttrib_Position, 2, GL_FLOAT, GL_FALSE, sizeof(ImDrawVert), base + offsetof(ImDrawVert, pos));
+			glVertexAttribPointer(kCCVertexAttrib_TexCoords, 2, GL_FLOAT, GL_FALSE, sizeof(ImDrawVert), base + offsetof(ImDrawVert, uv));
+			glVertexAttribPointer(kCCVertexAttrib_Color, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(ImDrawVert), base + offsetof(ImDrawVert, col));
 
-			for (unsigned int j = 0; j < cmd.ElemCount; j += 3) {
-				const auto a = vtxBuffer[idxBuffer[cmd.IdxOffset + j + 0]];
-				const auto b = vtxBuffer[idxBuffer[cmd.IdxOffset + j + 1]];
-				const auto c = vtxBuffer[idxBuffer[cmd.IdxOffset + j + 2]];
-				std::array<CCPoint, 3> points = {
-					frameToCocos(a.pos),
-					frameToCocos(b.pos),
-					frameToCocos(c.pos),
-				};
-				static constexpr auto ccc4FromImColor = [](const ImColor color) {
-					// beautiful
-					return ccc4f(color.Value.x, color.Value.y, color.Value.z, color.Value.w);
-				};
-				std::array<ccColor4F, 3> colors = {
-					ccc4FromImColor(a.col),
-					ccc4FromImColor(b.col),
-					ccc4FromImColor(c.col),
-				};
-
-				std::array<CCPoint, 3> uvs = {
-					ccp(a.uv.x, a.uv.y),
-					ccp(b.uv.x, b.uv.y),
-					ccp(c.uv.x, c.uv.y),
-				};
-
-				drawTriangle(points, colors, uvs);
-			}
+			glDrawElements(GL_TRIANGLES, cmd.ElemCount, IDX_TYPE, idx + cmd.IdxOffset);
 		}
 	}
 
@@ -468,17 +557,8 @@ void ImGuiCocos::legacyRenderFrame() const {
 }
 
 void ImGuiCocos::renderFrame() const {
-#if defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
-	static bool hasVAO = hasExtension("GL_APPLE_vertex_array_object");
-#else
-	static bool hasVAO = hasExtension("GL_ARB_vertex_array_object");
-#endif
-	if (!hasVAO || m_forceLegacy)
-		return legacyRenderFrame();
-
 	auto* drawData = ImGui::GetDrawData();
-
-	const bool hasVtxOffset = ImGui::GetIO().BackendFlags | ImGuiBackendFlags_RendererHasVtxOffset;
+	if (!drawData) return;
 
 #ifdef IMGUI_HAS_TEXTURES
 	if (drawData->Textures != nullptr) {
@@ -490,67 +570,71 @@ void ImGuiCocos::renderFrame() const {
 	}
 #endif
 
+	if (drawData->CmdListsCount == 0 || drawData->DisplaySize.x <= 0.f || drawData->DisplaySize.y <= 0.f)
+		return;
+
+	if (!s_caps.hasVAO || m_forceLegacy)
+		return legacyRenderFrame();
+
+	bool useBaseVertex = s_caps.hasBaseVertex;
+	auto tf = FrameTransform::current();
+
 	glEnable(GL_SCISSOR_TEST);
 
-	GLuint vao = 0;
-	GLuint vbos[2] = {0, 0};
+	if (s_vao == 0) {
+		glGenVertexArrays(1, &s_vao);
+		glGenBuffers(1, &s_vbo);
+		glGenBuffers(1, &s_ibo);
 
-	glGenVertexArrays(1, &vao);
-	glBindVertexArray(vao);
+		glBindVertexArray(s_vao);
+		glBindBuffer(GL_ARRAY_BUFFER, s_vbo);
+		glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s_ibo);
 
-	glGenBuffers(2, &vbos[0]);
+		glEnableVertexAttribArray(kCCVertexAttrib_Position);
+		glVertexAttribPointer(kCCVertexAttrib_Position, 2, GL_FLOAT, GL_FALSE, sizeof(ImDrawVert), reinterpret_cast<void*>(offsetof(ImDrawVert, pos)));
+		glEnableVertexAttribArray(kCCVertexAttrib_TexCoords);
+		glVertexAttribPointer(kCCVertexAttrib_TexCoords, 2, GL_FLOAT, GL_FALSE, sizeof(ImDrawVert), reinterpret_cast<void*>(offsetof(ImDrawVert, uv)));
+		glEnableVertexAttribArray(kCCVertexAttrib_Color);
+		glVertexAttribPointer(kCCVertexAttrib_Color, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(ImDrawVert), reinterpret_cast<void*>(offsetof(ImDrawVert, col)));
+	}
 
-	glBindBuffer(GL_ARRAY_BUFFER, vbos[0]);
-	glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, vbos[1]);
-
-	glEnableVertexAttribArray(kCCVertexAttrib_Position);
-	glVertexAttribPointer(kCCVertexAttrib_Position, 2, GL_FLOAT, GL_FALSE, sizeof(ImDrawVert), reinterpret_cast<void*>(offsetof(ImDrawVert, pos)));
-
-	glEnableVertexAttribArray(kCCVertexAttrib_TexCoords);
-	glVertexAttribPointer(kCCVertexAttrib_TexCoords, 2, GL_FLOAT, GL_FALSE, sizeof(ImDrawVert), reinterpret_cast<void*>(offsetof(ImDrawVert, uv)));
-
-	glEnableVertexAttribArray(kCCVertexAttrib_Color);
-	glVertexAttribPointer(kCCVertexAttrib_Color, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(ImDrawVert), reinterpret_cast<void*>(offsetof(ImDrawVert, col)));
-
-	auto* shader = CCShaderCache::sharedShaderCache()->programForKey(kCCShader_PositionTextureColor);
-	shader->use();
-	shader->setUniformsForBuiltins();
+	ScopedImGuiMatrix matrix(tf);
+	auto setupState = [] {
+		glBindVertexArray(s_vao);
+		glBindBuffer(GL_ARRAY_BUFFER, s_vbo);
+		useImGuiShader();
+	};
+	setupState();
 
 	for (int i = 0; i < drawData->CmdListsCount; ++i) {
 		auto* list = drawData->CmdLists[i];
-
-		// convert vertex coords to cocos space
-		for (auto& j : list->VtxBuffer) {
-			const auto point = frameToCocos(j.pos);
-			j.pos = ImVec2(point.x, point.y);
-		}
 
 		glBufferData(GL_ARRAY_BUFFER, list->VtxBuffer.Size * sizeof(ImDrawVert), list->VtxBuffer.Data, GL_STREAM_DRAW);
 		glBufferData(GL_ELEMENT_ARRAY_BUFFER, list->IdxBuffer.Size * sizeof(ImDrawIdx), list->IdxBuffer.Data, GL_STREAM_DRAW);
 
 		for (auto& cmd : list->CmdBuffer) {
 			if (cmd.UserCallback != nullptr) {
-				cmd.UserCallback(list, &cmd);
+				if (cmd.UserCallback == ImDrawCallback_ResetRenderState) {
+					setupState();
+				} else {
+					cmd.UserCallback(list, &cmd);
+				}
 				continue;
 			}
 
-			ccGLBindTexture2D(toGLTexture(cmd.GetTexID()));
-
-			const auto rect = cmd.ClipRect;
-			const auto orig = frameToCocos(ImVec2(rect.x, rect.y));
-			const auto end = frameToCocos(ImVec2(rect.z, rect.w));
-
-			if (end.x <= orig.x || end.y >= orig.y)
+			if (cmd.ElemCount == 0 || !tf.applyScissor(cmd.ClipRect))
 				continue;
 
-			CCDirector::sharedDirector()->getOpenGLView()->setScissorInPoints(orig.x, end.y, end.x - orig.x, orig.y - end.y);
+			ccGLBindTexture2D(toGLTexture(cmd.GetTexID()));
 
-			if (hasVtxOffset) {
+			auto* idxOffset = reinterpret_cast<void*>(static_cast<uintptr_t>(cmd.IdxOffset) * sizeof(ImDrawIdx));
+
+			if (useBaseVertex) {
 			#if !defined(GEODE_IS_MOBILE)
-				glDrawElementsBaseVertex(GL_TRIANGLES, cmd.ElemCount, GL_UNSIGNED_SHORT, reinterpret_cast<void*>(cmd.IdxOffset * sizeof(ImDrawIdx)), cmd.VtxOffset);
+				glDrawElementsBaseVertex(GL_TRIANGLES, cmd.ElemCount, IDX_TYPE, idxOffset, static_cast<GLint>(cmd.VtxOffset));
 			#endif
 			} else {
-				glDrawElements(GL_TRIANGLES, cmd.ElemCount, GL_UNSIGNED_SHORT, reinterpret_cast<void*>(cmd.IdxOffset * sizeof(ImDrawIdx)));
+				glDrawElements(GL_TRIANGLES, cmd.ElemCount, IDX_TYPE, idxOffset);
 			}
 		}
 	}
@@ -558,9 +642,6 @@ void ImGuiCocos::renderFrame() const {
 	glBindVertexArray(0);
 	glBindBuffer(GL_ARRAY_BUFFER, 0);
 	glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-
-	glDeleteBuffers(2, &vbos[0]);
-	glDeleteVertexArrays(1, &vao);
 
 	glDisable(GL_SCISSOR_TEST);
 }

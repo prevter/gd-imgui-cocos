@@ -10,6 +10,11 @@
 
 using namespace geode::prelude;
 
+static bool shouldBlockInput() {
+	auto& inst = ImGuiCocos::get();
+	return inst.isVisible() && inst.getInputMode() == ImGuiCocos::InputMode::Blocking;
+}
+
 #if !defined(GEODE_IS_IOS) && !defined(IMGUI_ILL_HANDLE_TOUCHES)
 class $modify(ImGuiCocosCCMouseDispatcher, CCMouseDispatcher) {
 	bool dispatchScrollMSG(float y, float x) {
@@ -20,7 +25,7 @@ class $modify(ImGuiCocosCCMouseDispatcher, CCMouseDispatcher) {
 		static constexpr float scrollMult = 1.f / 10.f;
 		io.AddMouseWheelEvent(x * scrollMult, -y * scrollMult);
 
-		if (!io.WantCaptureMouse) {
+		if (!io.WantCaptureMouse && !shouldBlockInput()) {
 			return CCMouseDispatcher::dispatchScrollMSG(y, x);
 		}
 		return true;
@@ -53,7 +58,7 @@ class $modify(ImGuiCocosCCIMEDispatcher, CCIMEDispatcher) {
 			return CCIMEDispatcher::dispatchInsertText(text, len IF_2_2(, keys));
 
 		auto& io = ImGui::GetIO();
-		if (!io.WantCaptureKeyboard) {
+		if (!io.WantCaptureKeyboard && !shouldBlockInput()) {
 			CCIMEDispatcher::dispatchInsertText(text, len IF_2_2(, keys));
 		}
 
@@ -75,7 +80,7 @@ class $modify(ImGuiCocosCCIMEDispatcher, CCIMEDispatcher) {
 			return CCIMEDispatcher::dispatchDeleteBackward();
 
 		auto& io = ImGui::GetIO();
-		if (!io.WantCaptureKeyboard) {
+		if (!io.WantCaptureKeyboard && !shouldBlockInput()) {
 			CCIMEDispatcher::dispatchDeleteBackward();
 		}
 		// is this really how youre supposed to do this
@@ -119,11 +124,6 @@ ImGuiKey cocosToImGuiKey(cocos2d::enumKeyCodes key) {
 
 		default: return ImGuiKey_None;
 	}
-}
-
-bool shouldBlockInput() {
-	auto& inst = ImGuiCocos::get();
-	return inst.isVisible() && inst.getInputMode() == ImGuiCocos::InputMode::Blocking;
 }
 
 // Use Geode 5.0.0 keyboard event system
